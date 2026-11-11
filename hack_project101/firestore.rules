@@ -1,0 +1,74 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function currentRole() {
+      return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role : '';
+    }
+    function admin() { return currentRole() == 'admin'; }
+    function worker() { return currentRole() == 'worker'; }
+    function owner(id) { return signedIn() && request.auth.uid == id; }
+    function assigned(id) {
+      return worker() &&
+        exists(/databases/$(database)/documents/patients/$(id)) &&
+        get(/databases/$(database)/documents/patients/$(id)).data.assignedWorkerId == request.auth.uid;
+    }
+    function patientAccess(id) { return owner(id) || assigned(id) || admin(); }
+
+    match /users/{uid} {
+      allow get: if owner(uid) || admin();
+      allow list: if admin();
+      allow create: if owner(uid)
+        && request.resource.data.keys().hasOnly(['name','email','role','phone','registration','hospital','cnic','createdAt'])
+        && request.resource.data.role in ['patient','worker_pending']
+        && request.resource.data.email == request.auth.token.email;
+      // Role cannot be changed by the user. Admin approval is privileged.
+      allow update, delete: if admin();
+    }
+
+    match /patients/{patientId} {
+      allow get: if patientAccess(patientId);
+      // To query all patient records, a worker's query must filter by assignedWorkerId.
+      allow list: if admin() || (worker() && resource.data.assignedWorkerId == request.auth.uid);
+      allow create: if owner(patientId) && currentRole() == 'patient'
+        && request.resource.data.keys().hasOnly(['name','createdAt','assignedWorkerId','pregnancyWeeks','hasGdm','language','phone'])
+        && request.resource.data.assignedWorkerId == '';
+      allow update: if admin() || (owner(patientId) && currentRole() == 'patient'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pregnancyWeeks','hasGdm','language','phone','emergencyContact'])
+        && request.resource.data.pregnancyWeeks is int
+        && request.resource.data.pregnancyWeeks >= 0 && request.resource.data.pregnancyWeeks <= 42);
+      allow delete: if admin();
+
+      match /readings/{readingId} {
+        allow read: if patientAccess(patientId);
+        allow create: if owner(patientId) && currentRole() == 'patient'
+          && request.resource.data.patientId == patientId
+          && request.resource.data.confirmed == true
+          && request.resource.data.value is number
+          && request.resource.data.value > 0 && request.resource.data.value <= 1000
+          && request.resource.data.unit in ['mg/dL', 'mmol/L']
+          && request.resource.data.type in ['Fasting','After meal','Other'];
+        allow update, delete: if false;
+      }
+      match /reports/{reportId} {
+        allow read: if patientAccess(patientId);
+        allow create: if owner(patientId) && currentRole() == 'patient'
+          && request.resource.data.patientId == patientId
+          && request.resource.data.status == 'new'
+          && request.resource.data.urgency in ['urgent', 'needs_review'];
+        allow update: if assigned(patientId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status','reviewedBy','reviewedAt'])
+          && request.resource.data.status == 'reviewed'
+          && request.resource.data.reviewedBy == request.auth.uid;
+        allow delete: if false;
+      }
+      match /notes/{noteId} {
+        allow read: if patientAccess(patientId);
+        allow create: if assigned(patientId) && request.resource.data.workerId == request.auth.uid
+          && request.resource.data.text is string && request.resource.data.text.size() <= 2000;
+        allow update, delete: if false;
+      }
+    }
+  }
+}

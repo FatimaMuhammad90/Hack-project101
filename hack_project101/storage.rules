@@ -1,0 +1,22 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() { return request.auth != null; }
+    function role() {
+      return signedIn() && firestore.exists(/databases/(default)/documents/users/$(request.auth.uid))
+        ? firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role : '';
+    }
+    function canRead(patientId) {
+      return signedIn() && (request.auth.uid == patientId || role() == 'admin' ||
+        (role() == 'worker' && firestore.exists(/databases/(default)/documents/patients/$(patientId)) &&
+         firestore.get(/databases/(default)/documents/patients/$(patientId)).data.assignedWorkerId == request.auth.uid));
+    }
+    match /patients/{patientId}/glucose/{fileName} {
+      allow read: if canRead(patientId);
+      allow create: if signedIn() && request.auth.uid == patientId
+        && role() == 'patient' && request.resource.size < 8 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow update, delete: if false;
+    }
+  }
+}
